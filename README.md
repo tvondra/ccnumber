@@ -28,10 +28,60 @@ random (and thus non-compressible). The CPU usage is due to having to
 decrypt the values before performing operations.
 
 
-Components
-----------
+Installing and usage
+--------------------
 
-s
+The PoC is consists of two main parts:
+
+* an extension implementing a "ccnumber" encrypted data type, offloading
+  operations to the trusted component
+
+* "ccnumber-comparator" trusted component, performing operation on the
+  encrypted data
+
+There are also three python scripts useful for generating sample data
+with credit card numbers:
+
+* `ccnumber-generator.py` - generates file with ~220k records with both
+  encrypted and plaintext card numbers
+
+* `ccnumber-encrypt.py` - encrypts a given text value (card number)
+
+* `ccnumber-dencrypt.py` - decrypts a given text value (card number)
+
+
+The extension may be built like this:
+
+  $ make install
+  $ make ccnumber-comparator
+
+The trusted component (comparator) then needs to be started on a given
+port (e.g. 9999):
+
+  $ ./ccnumber-comparator 9999
+
+Then you can install and use the extension from a database as usual:
+
+  db=# CREATE EXTENSION ccnumber;
+  db=# CREATE TABLE t (cc_encrypted ccnumber, cc_plaintext text);
+
+Generating the sample data is as simple as running the python script:
+
+  ./ccnumber-generator.py > ccnumber.data
+
+  db=# COPY t FROM '/path/to/ccnumber.data';
+
+  db=# ANALYZE t;
+
+  db=# EXPLAIN SELECT * FROM t WHERE cc_encrypted = '\x08b90080a07f2d...';
+
+There are three GUC options affecting the offloading:
+
+* `ccnumber.comparator_host` - comparator hostname/IP (default: 127.0.0.1)
+
+* `ccnumber.comparator_port` - comparator port (default: 9999)
+
+* `ccnumber.optimize_remote_calls` - use hashes to optimize-out call
 
 
 Possible improvements
