@@ -2,16 +2,19 @@
 
 import binascii
 import copy
-import hashlib
 import math
+import nacl.encoding
 import nacl.secret
 import nacl.utils
 import random
+
+from nacl.hash import blake2b
 
 # This must be kept secret, this is the combination to your safe
 # key = nacl.utils.random(nacl.secret.SecretBox.KEY_SIZE)
 # print binascii.hexlify(key)
 key = binascii.unhexlify('3f91942d47091eac32203d75188125fba55231ca78dc133f8dff6504bef51e2c')
+auth_key = binascii.unhexlify('7a644823f7878926e8bf29740d7dd01dbc6bc9cabb7dd5278c38182c9689de7d')
 box = nacl.secret.SecretBox(key)
 
 prefixes_visa = ['4539', '4556', '4916', '4532', '4929', '4486', '4716']
@@ -72,14 +75,15 @@ def print_encrypted_ccnumbers(ccnumbers, max_count):
 
 		for c in ccnumbers:
 			if random.random() < 0.5:
-				print ("\\\\x" + binascii.hexlify(box.encrypt(c)) + "\t" + c)
+				h = blake2b(c, key=auth_key, encoder=nacl.encoding.HexEncoder)[0:8]
+				print ("\\\\x" + h + binascii.hexlify(box.encrypt(c)) + "\t" + c)
 
 
 ccnumbers = []
 
-ccnumbers.extend(generate_card_numbers(prefixes_mastercard, 16, 10000))
-ccnumbers.extend(generate_card_numbers(prefixes_visa, 16, 10000))
-ccnumbers.extend(generate_card_numbers(prefixes_visa, 13, 1000))
-ccnumbers.extend(generate_card_numbers(prefixes_amex, 15, 1000))
+ccnumbers.extend(generate_card_numbers(prefixes_mastercard, 16, 100000))
+ccnumbers.extend(generate_card_numbers(prefixes_visa, 16, 100000))
+ccnumbers.extend(generate_card_numbers(prefixes_visa, 13, 10000))
+ccnumbers.extend(generate_card_numbers(prefixes_amex, 15, 10000))
 
 print_encrypted_ccnumbers(ccnumbers, 20)

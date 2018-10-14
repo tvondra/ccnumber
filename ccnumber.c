@@ -45,6 +45,7 @@ static int	comparator_pid = -1;
 /* where to find the comparator */
 static int ccnumber_comparator_port = 9999;
 static char *ccnumber_comparator_host = "127.0.0.1";
+static bool ccnumber_comparator_optimize = true;
 
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static void ccnumber_ExecutorEnd(QueryDesc *queryDesc);
@@ -119,6 +120,17 @@ _PG_init(void)
 							   NULL,
 							   NULL);
 
+	DefineCustomBoolVariable("ccnumber.optimize_remote_calls",
+							 "eliminate remote calls where possible",
+							 NULL,
+							 &ccnumber_comparator_optimize,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = ccnumber_ExecutorEnd;
 }
@@ -166,28 +178,45 @@ ccnumbercmp(bytea *left, bytea *right)
 	char	   *ptr;
 	int			lena, lenb;
 
+	if (ccnumber_comparator_optimize)
+	{
+		char	   *lstr, *rstr;
+		int			lhash, rhash;
+
+		lstr = VARDATA_ANY(left);
+		rstr = VARDATA_ANY(right);
+
+		memcpy(&lhash, lstr, sizeof(int));
+		memcpy(&rhash, rstr, sizeof(int));
+
+		if (lhash < rhash)
+			return -1;
+		else if (lhash > rhash)
+			return 1;
+	}
+
 	/* ensure connection to comparator */
 	connect_to_comparator();
 
-	len = VARSIZE_ANY_EXHDR(left) + VARSIZE_ANY_EXHDR(right) + 2 * sizeof(int);
+	len = VARSIZE_ANY_EXHDR(left) + VARSIZE_ANY_EXHDR(right) + 2 * sizeof(int) - 8;
 
 	ptr = buffer;
 
 	memcpy(ptr, &len, sizeof(int));
 	ptr += sizeof(int);
 
-	lena = VARSIZE_ANY_EXHDR(left);
+	lena = VARSIZE_ANY_EXHDR(left) - 4;
 	memcpy(ptr, &lena, sizeof(int));
 	ptr += sizeof(int);
 
-	memcpy(ptr, VARDATA_ANY(left), lena);
+	memcpy(ptr, VARDATA_ANY(left) + 4, lena);
 	ptr += lena;
 
-	lenb = VARSIZE_ANY_EXHDR(right);
+	lenb = VARSIZE_ANY_EXHDR(right) - 4;
 	memcpy(ptr, &lenb, sizeof(int));
 	ptr += sizeof(int);
 
-	memcpy(ptr, VARDATA_ANY(right), lenb);
+	memcpy(ptr, VARDATA_ANY(right) + 4, lenb);
 	ptr += lenb;
 
 	len += sizeof(int);
@@ -339,6 +368,24 @@ ccnumber_ge(PG_FUNCTION_ARGS)
 
 	PG_RETURN_BOOL(result);
 }
+
+
+PG_FUNCTION_INFO_V1(ccnumber_hash);
+
+Datum
+ccnumber_hash(PG_FUNCTION_ARGS)
+{
+	bytea	   *val = PG_GETARG_BYTEA_PP(0);
+	int			result;
+
+	memcpy(&result, VARDATA_ANY(val), sizeof(int));
+
+	/* Avoid leaking memory for toasted inputs */
+	PG_FREE_IF_COPY(val, 0);
+
+	PG_RETURN_DATUM(Int32GetDatum(result));
+}
+
 
 /*
  *		===================

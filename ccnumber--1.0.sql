@@ -180,6 +180,21 @@ DEFAULT FOR TYPE ccnumber USING btree AS
     OPERATOR    5   >  (ccnumber, ccnumber),
     FUNCTION    1   ccnumber_cmp(ccnumber, ccnumber);
 
+CREATE FUNCTION ccnumber_hash(ccnumber)
+RETURNS int4
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+--
+-- The hash indexing operator class.
+--
+
+CREATE OPERATOR CLASS ccnumber_ops
+DEFAULT FOR TYPE ccnumber USING hash AS
+    OPERATOR    1   =  (ccnumber, ccnumber),
+    FUNCTION    1   ccnumber_hash(ccnumber);
+
+
 --
 -- Aggregates.
 --
