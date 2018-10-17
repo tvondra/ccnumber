@@ -11,4 +11,4 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
 ccnumber-comparator:
-	gcc ccnumber-comparator.c $(CFLAGS) -lpthread -lsodium -o ccnumber-comparator
+	gcc ccnumber-comparator.c $(CFLAGS) -lpthread -lsodium -lrt -o ccnumber-comparator
