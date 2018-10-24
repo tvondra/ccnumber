@@ -20,6 +20,13 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <errno.h>
+
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <mqueue.h>
 
 #include "postgres.h"
 
@@ -39,56 +46,131 @@ void		_PG_fini(void);
  * TCP socket (we also check PID, because we don't want child to use the
  * socket opened by parent process).
  */
-static int	comparator_socket = -1;
+static int	comparator_queue = -1;
 static int	comparator_pid = -1;
 
+#define		SHMEM_KEY		23110
+#define		MAX_QUEUES		32
+#define		QUEUE_NAME_LEN	64
+
+typedef struct qname_t
+{
+	char	name[QUEUE_NAME_LEN];
+} qname_t;
+
+typedef struct queues_t
+{
+	slock_t	lock;					/* spinlock (when acquiring queue) */
+	char	used[MAX_QUEUES];		/* number of concurrent queues */
+	qname_t	names_in[MAX_QUEUES];	/* input queues (requests) */
+	qname_t	names_out[MAX_QUEUES];	/* output queues (responsed) */
+} queues_t;
+
+static queues_t *queues = NULL;
+
+static mqd_t queue_descriptors_in[MAX_QUEUES];
+static mqd_t queue_descriptors_out[MAX_QUEUES];
+
 /* where to find the comparator */
-static int ccnumber_comparator_port = 9999;
-static char *ccnumber_comparator_host = "127.0.0.1";
 static bool ccnumber_comparator_optimize = true;
 
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
+static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
+static ExecutorRun_hook_type prev_ExecutorRun = NULL;
+
 static void ccnumber_ExecutorEnd(QueryDesc *queryDesc);
+static void ccnumber_ExecutorFinish(QueryDesc *queryDesc);
+static void ccnumber_ExecutorRun(QueryDesc *queryDesc,
+									   ScanDirection direction,
+									   uint64 count,
+									   bool execute_once);
 
-/*
- * Make sure we're connected to the comparator. Simply open a TCP socket
- * (unless we already have one for this process).
- */
 static void
-connect_to_comparator(void)
+attach_queues(void)
 {
-	struct sockaddr_in serv_addr;
-	int		flag = 1;
+	int		i;
+	int		shmem_id;
+	key_t	shmem_key = SHMEM_KEY;
 
-	if ((comparator_socket > 0) && comparator_pid == getpid())
+	if (queues)
+		return;
+
+	shmem_id = shmget(shmem_key, sizeof(queues_t), 0666);
+	if (shmem_id < 0)
+	{
+		elog(ERROR, "failed to get shmem segment");
+		return;
+	}
+
+	queues = shmat(shmem_id, NULL, 0);
+	if (queues == (void *) -1)
+	{
+		elog(ERROR, "failed to attach shmem segment");
+		return;
+	}
+
+	for (i = 0; i < MAX_QUEUES; i++)
+	{
+		elog(WARNING, "opening queue '%s' / '%s'\n", queues->names_in[i].name, queues->names_out[i].name);
+
+		queue_descriptors_in[i] = mq_open(queues->names_out[i].name, O_RDWR, 0666, NULL);
+		if (queue_descriptors_in[i] == (mqd_t) -1)
+			elog(ERROR, "failed to open queue");
+
+		queue_descriptors_out[i] = mq_open(queues->names_in[i].name, O_RDWR, 0666, NULL);
+		if (queue_descriptors_out[i] == (mqd_t) -1)
+			elog(ERROR, "failed to open queue");
+
+		elog(WARNING, "opening queue '%s' / '%s' => %d / %d\n", queues->names_in[i].name, queues->names_out[i].name, queue_descriptors_in[i], queue_descriptors_out[i]);
+	}
+
+}
+
+static void
+acquire_queue(void)
+{
+	int			i;
+
+	attach_queues();
+
+	if ((comparator_queue != -1) && (comparator_pid == getpid()))
 		return;
 
 	comparator_pid = getpid();
-	comparator_socket = socket(AF_INET, SOCK_STREAM, 0);
 
-	if (comparator_socket < 0)
-		goto error;
+	SpinLockAcquire(&queues->lock);
 
-	/* XXX: send the data right away, don't wait - important for low latency */
-	if (setsockopt(comparator_socket, IPPROTO_TCP, TCP_NODELAY, (char *) &flag, sizeof(int)) < 0)
-		goto error;
+	for (i = 0; i < MAX_QUEUES; i++)
+	{
+		if (!queues->used[i])
+		{
+			queues->used[i] = true;
+			comparator_queue = i;
+			break;
+		}
+	}
 
-	memset(&serv_addr, '0', sizeof(serv_addr));
-   
-	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_port = htons(ccnumber_comparator_port);
+	SpinLockRelease(&queues->lock);
 
-	if (inet_pton(AF_INET, ccnumber_comparator_host, &serv_addr.sin_addr) <= 0)
-		goto error;
+	if (comparator_queue == -1)
+		elog(ERROR, "failed to acquire comparator queue");
+}
 
-	if (connect(comparator_socket, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-		goto error;
+static void
+release_queue(void)
+{
+	attach_queues();
 
-	return;
+	if ((comparator_queue == -1) || (comparator_pid != getpid()))
+		return;
 
-error:
-	comparator_socket = -1;
-	elog(ERROR, "connection to comparator failed (socket creation)");
+	SpinLockAcquire(&queues->lock);
+	queues->used[comparator_queue] = false;
+	SpinLockRelease(&queues->lock);
+
+	elog(WARNING, "%d : released queue %d", getpid(), comparator_queue);
+
+	comparator_queue = -1;
 }
 
 /*
@@ -97,29 +179,6 @@ error:
 void
 _PG_init(void)
 {
-	DefineCustomIntVariable("ccnumber.comparator_port",
-							"sets the comparator port to connect to",
-							NULL,
-							&ccnumber_comparator_port,
-							9999,
-							1, INT_MAX,
-							PGC_SUSET,
-							0,
-							NULL,
-							NULL,
-							NULL);
-
-	DefineCustomStringVariable("ccnumber.comparator_host",
-							   "sets the comparator host to connect to",
-							   NULL,
-							   &ccnumber_comparator_host,
-							   "127.0.0.1",
-							   PGC_SUSET,
-							   0,
-							   NULL,
-							   NULL,
-							   NULL);
-
 	DefineCustomBoolVariable("ccnumber.optimize_remote_calls",
 							 "eliminate remote calls where possible",
 							 NULL,
@@ -133,6 +192,12 @@ _PG_init(void)
 
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = ccnumber_ExecutorEnd;
+
+	prev_ExecutorFinish = ExecutorFinish_hook;
+	ExecutorFinish_hook = ccnumber_ExecutorFinish;
+
+	prev_ExecutorRun = ExecutorRun_hook;
+	ExecutorRun_hook = ccnumber_ExecutorRun;
 }
 
 /*
@@ -143,6 +208,8 @@ _PG_fini(void)
 {
 	/* Uninstall hooks. */
 	ExecutorEnd_hook = prev_ExecutorEnd;
+	ExecutorFinish_hook = prev_ExecutorFinish;
+	ExecutorRun_hook = prev_ExecutorRun;
 }
 
 /*
@@ -151,11 +218,7 @@ _PG_fini(void)
 static void
 ccnumber_ExecutorEnd(QueryDesc *queryDesc)
 {
-	if (comparator_socket != -1)
-	{
-		close(comparator_socket);
-		comparator_socket = -1;
-	}
+	release_queue();
 
 	if (prev_ExecutorEnd)
 		prev_ExecutorEnd(queryDesc);
@@ -163,6 +226,33 @@ ccnumber_ExecutorEnd(QueryDesc *queryDesc)
 		standard_ExecutorEnd(queryDesc);
 }
 
+/*
+ * ExecutorEnd hook: close the comparator connection (if opened)
+ */
+static void
+ccnumber_ExecutorFinish(QueryDesc *queryDesc)
+{
+	release_queue();
+
+	if (prev_ExecutorFinish)
+		prev_ExecutorFinish(queryDesc);
+	else
+		standard_ExecutorFinish(queryDesc);
+}
+
+static void
+ccnumber_ExecutorRun(QueryDesc *queryDesc,
+					 ScanDirection direction,
+					 uint64 count,
+					 bool execute_once)
+{
+	release_queue();
+
+	if (prev_ExecutorRun)
+		prev_ExecutorRun(queryDesc, direction, count, execute_once);
+	else
+		standard_ExecutorRun(queryDesc, direction, count, execute_once);
+}
 
 /*
  * ccnumber_cmp()
@@ -174,9 +264,12 @@ ccnumbercmp(bytea *left, bytea *right)
 {
 	int			len;
 	char		response;
-	char		buffer[1024];
+	char		buffer[2048];
 	char	   *ptr;
 	int			lena, lenb;
+	mqd_t		mqd_in;
+	mqd_t		mqd_out;
+	int			nbytes;
 
 	if (ccnumber_comparator_optimize)
 	{
@@ -196,7 +289,7 @@ ccnumbercmp(bytea *left, bytea *right)
 	}
 
 	/* ensure connection to comparator */
-	connect_to_comparator();
+	acquire_queue();
 
 	len = VARSIZE_ANY_EXHDR(left) + VARSIZE_ANY_EXHDR(right) + 2 * sizeof(int) - 8;
 
@@ -221,20 +314,26 @@ ccnumbercmp(bytea *left, bytea *right)
 
 	len += sizeof(int);
 
-	/* send message */
-	if (send(comparator_socket, buffer, len, 0) != len)
-		goto error;
+	mqd_in = queue_descriptors_in[comparator_queue];
+	mqd_out = queue_descriptors_out[comparator_queue];
+
+	/* send message through the queue */
+	if (mq_send(mqd_out, buffer, len, 0) != 0)
+		elog(ERROR, "comparator queue failure");
 
 	/* receive response (single character) */
-	if ((len = recv(comparator_socket, &response, 1, MSG_WAITALL)) < 0)
-		goto error;
+	nbytes = mq_receive(mqd_in, buffer, 2048, NULL);
+	if (nbytes != 1)
+		elog(ERROR, "mq_receive failed (mqd %d, bytes %d)", mqd_in, nbytes);
+
+	memcpy(&response, buffer, 1);
 
 	if ((response >= -1) && (response <= 1))
 		return (int)response;
 
-error:
-	close(comparator_socket);
-	comparator_socket = -1;
+	elog(WARNING, "%d : queue %d (%d / %d) response = %d (len = %d)", getpid(), comparator_queue, mqd_in, mqd_out, response, nbytes);
+
+	release_queue();
 	elog(ERROR, "comparator failure");
 }
 

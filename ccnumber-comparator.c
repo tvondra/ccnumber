@@ -14,8 +14,41 @@
 #include <sys/time.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+
+#include <sys/ipc.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <mqueue.h>
 
 #include <sodium.h>
+
+#include "slock.h"
+
+#define		SHMEM_KEY		23110
+#define		MAX_QUEUES		32
+// #define		QUEUE_SIZE		1024
+#define		QUEUE_NAME_LEN	64
+
+typedef struct qname_t
+{
+	char	name[QUEUE_NAME_LEN];
+} qname_t;
+
+typedef struct queues_t
+{
+	slock_t	lock;					/* spinlock (when acquiring queue) */
+	char	used[MAX_QUEUES];		/* number of concurrent queues */
+	qname_t	names_in[MAX_QUEUES];	/* input queues (requests) */
+	qname_t	names_out[MAX_QUEUES];	/* output queues (responsed) */
+} queues_t;
+
+static queues_t *queues = NULL;
+
+static mqd_t queue_descriptors_in[MAX_QUEUES];
+static mqd_t queue_descriptors_out[MAX_QUEUES];
 
 /* shouldn't really be hard-coded, but good enough for PoC */
 #define SECRET_KEY	"3f91942d47091eac32203d75188125fba55231ca78dc133f8dff6504bef51e2c"
@@ -57,18 +90,20 @@ hex2bin(const char *str, unsigned char *out)
 static void *
 handle_connection(void *data)
 {
-	int				clientfd = *(int *)data;	/* we pass the file descriptor */
-	unsigned char	buffer[1024];
+	int				qid = *(int *)data;
+	mqd_t			mqd_in = queue_descriptors_in[qid];
+	mqd_t			mqd_out = queue_descriptors_out[qid];
 	int				ncomparisons = 0;
 
 	while (1)
 	{
-		int		tmp;
 		int		len,		/* total length */
 				alen,		/* first value */
 				blen;		/* second value */
 		int		ret;
 		char	retc;
+		char	buffer[2048];
+		int		nbytes;
 
 		unsigned char	a_decrypted[128],
 						b_decrypted[128];
@@ -80,29 +115,27 @@ handle_connection(void *data)
 					   *b_ciphertext,
 					   *ptr;
 
-		/* the first bit is the message length */
-		tmp = recv(clientfd, &len, 4, MSG_WAITALL);
+		/* wait until we get request on on queue */
+		nbytes = mq_receive(mqd_in, buffer, 2048, NULL);
+		if (nbytes < 0)
+		{
+			perror("mq_receive failed");
+			goto error;
+		}
 
-		/*
-		 * This is expected when the client simply closes the connection,
-		 * so no error message here.
-		 */
-		if (tmp == 0)
-			break;
-		else if (tmp < 4)
+		/* the first bit is the message length */
+		memcpy(&len, buffer, sizeof(int));
+
+		/* cross-check message length with queue length */
+		if (len + sizeof(int) != nbytes)
 		{
 			/* incomplete length or message means broken connection */
-			perror("incomplete message length (expected 4), closing connection");
-			break;
+			fprintf(stderr, "incomplete message length: header=%d queue=%d\n", len, nbytes);
+			goto error;
 		}
 
-		if (recv(clientfd, buffer, len, MSG_WAITALL) < len)
-		{
-			perror("incomplete message, closing connection");
-			break;
-		}
-
-		ptr = buffer;
+		/* message starts after the length */
+		ptr = (unsigned char *) buffer + sizeof(int);
 
 		/* extract first value from buffer */
 		memcpy(&alen, ptr, sizeof(int));
@@ -130,15 +163,15 @@ handle_connection(void *data)
 		if (crypto_secretbox_open_easy(a_decrypted, a_ciphertext, alen, a_nonce, key) != 0)
 		{
 			/* something went wrong (corrupted data?), give up and close connection */
-			perror("failed to decrypt data, closing connection");
-			break;
+			fprintf(stderr, "failed to decrypt data, closing connection\n");
+			goto error;
 		}
 
 		if (crypto_secretbox_open_easy(b_decrypted, b_ciphertext, blen, b_nonce, key) != 0)
 		{
 			/* something went wrong (corrupted data?), give up and close connection */
-			perror("failed to decrypt data, closing connection");
-			break;
+			fprintf(stderr, "failed to decrypt data, closing connection\n");
+			goto error;
 		}
 
 		alen -= crypto_secretbox_MACBYTES;
@@ -160,10 +193,10 @@ handle_connection(void *data)
 		else
 			retc = 1;
 
-		if (send(clientfd, &retc, 1, 0) < 1)
+		if (mq_send(mqd_out, &retc, sizeof(retc), 0) != 0)
 		{
-			perror("failed to send response to client");
-			break;
+			fprintf(stderr, "failed to send response\n");
+			goto error;
 		}
 
 		ncomparisons++;
@@ -200,7 +233,7 @@ handle_connection(void *data)
 				{
 					double time_delta = time - report_time;
 
-					printf("%f %d %f %f\n", time, report_comparisons, time_delta,
+					fprintf(stderr, "%f %d %f %f\n", time, report_comparisons, time_delta,
 						   (report_comparisons / time_delta));
 
 					report_time = time;
@@ -211,78 +244,121 @@ handle_connection(void *data)
 			pthread_spin_unlock(&report_lock);
 		}
 
+		continue;
+
+error:
+		/* send response meaning "invalid" */
+		retc = 2;
+		if (mq_send(mqd_out, &retc, sizeof(retc), 0) != 0)
+			fprintf(stderr, "mq_send failed (again)");
 	}
 
-	close(clientfd);
 	free(data);
 
 	return NULL;
 }
 
+static queues_t *
+create_queues(void)
+{
+	int		i;
+	int		shmem_id;
+	key_t	shmem_key = SHMEM_KEY;
+
+	shmem_id = shmget(shmem_key, sizeof(queues_t), IPC_CREAT | 0666);
+
+	if (shmem_id < 0)
+	{
+		perror("failed to create shmem segment");
+		exit(1);
+	}
+
+	queues = shmat(shmem_id, NULL, 0);
+
+	if (queues == (void *) -1)
+	{
+		perror("failed to attach shmem segment");
+		exit(2);
+	}
+
+	SpinLockInit(&queues->lock);
+	memset(queues->used, 0, sizeof(char) * MAX_QUEUES);
+
+	for (i = 0; i < MAX_QUEUES; i++)
+	{
+		struct mq_attr	attr;
+
+		attr.mq_flags = 0;
+		attr.mq_maxmsg = 10;
+		attr.mq_msgsize = 1024;
+		attr.mq_curmsgs = 0;
+
+		sprintf(queues->names_in[i].name, "/ccnumber_queue_in_%d", i);
+		sprintf(queues->names_out[i].name, "/ccnumber_queue_out_%d", i);
+
+		mq_unlink(queues->names_in[i].name);
+		queue_descriptors_in[i] = mq_open(queues->names_in[i].name, O_RDWR | O_CREAT, 0666, &attr);
+
+		if (queue_descriptors_in[i] == (mqd_t) -1)
+		{
+			perror("failed to create queue");
+			exit(3);
+		}
+
+		fprintf(stderr, "creating input queue '%s' => %d\n", queues->names_in[i].name, queue_descriptors_in[i]);
+
+		mq_unlink(queues->names_out[i].name);
+		queue_descriptors_out[i] = mq_open(queues->names_out[i].name, O_RDWR | O_CREAT, 0666, &attr);
+
+		if (queue_descriptors_out[i] == (mqd_t) -1)
+		{
+			perror("failed to create queue");
+			exit(3);
+		}
+
+		fprintf(stderr, "creating output queue '%s' => %d\n", queues->names_out[i].name, queue_descriptors_out[i]);
+	}
+
+	return queues;
+}
 
 int main(int argc, char **argv)
 {
-	int					fd;
-	struct sockaddr_in	serv_addr;
-	int					flag = 1;
-	int					port = atoi(argv[1]);
+	int					i;
+	pthread_t			threads[MAX_QUEUES];
+	struct timeval			tv;
+
+	queues = create_queues();
+
+	if (gettimeofday(&tv, NULL) != 0)
+		perror("gettimeofday failed");
+
+	report_time = ((double)tv.tv_sec + (double) tv.tv_usec / 1000000.0);
 
 	pthread_spin_init(&report_lock, PTHREAD_PROCESS_PRIVATE);
 
 	/* decode the encryption key */
 	hex2bin(SECRET_KEY, key);
 
-	fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0)
+	for (i = 0; i < MAX_QUEUES; i++)
 	{
-		perror("failed to open a socket");
-		exit(2);
-	}
+		int *id = (int *) malloc(sizeof(int));
+		*id = i;
 
-	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *) &flag, sizeof(int)) < 0)
-		perror("setsockopt failed");
+		printf("starting thread for queues '%s' / '%s' (%d)\n", queues->names_in[i].name, queues->names_out[i].name, i);
 
-	memset(&serv_addr, '0', sizeof(serv_addr));
-
-	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	serv_addr.sin_port = htons(port);
-
-	if (bind(fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0)
-	{
-		perror("failed to bind a socket to port");
-		exit(3);
-	}
-
-	if (listen(fd, 10) < 0)
-	{
-		perror("failed to listen on a socket");
-		exit(4);
-	}
-
-	while(1)
-	{
-		int clientfd = accept(fd, (struct sockaddr*)NULL, NULL);
-		pthread_t thread;
-
-		int *data = (int *) malloc(sizeof(int));
-		*data = clientfd;
-
-		printf("opened socket %d\n", clientfd);
-
-		if (clientfd < 0)
-		{
-			perror("failed to accept a connection on a socket");
-			continue;
-		}
-
-		/* start thread handling connection */
-		if (pthread_create(&thread, NULL, handle_connection, data) != 0)
+		/* start a separate thread for each queue */
+		if (pthread_create(&threads[i], NULL, handle_connection, id) != 0)
 		{
 			perror("failed to create connection thread");
 			continue;
 		}
 	}
+	printf("threads started\n");
 
-	close(fd);
+	for (i = 0; i < MAX_QUEUES; i++)
+	{
+		pthread_join(threads[i], NULL);
+	}
+
 }
